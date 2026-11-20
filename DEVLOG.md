@@ -231,3 +231,148 @@ runs; worst runtime on a final-size case is ~0.6 s of the 8 s cap.
   re-derived from each case's own history at runtime.
 - The house AI forecast is an unknown quantity; the bar used here is the
   better of the two documented baselines.
+
+## V3 — 2026-11-20 (built for the final case, not the practice board)
+
+The practice score does not count toward the prize; the final case f00
+does (checkpoint 2026-11-21T11:30Z, target 2026-11-26T00:00Z, horizon
+6,510 min), and a prize requires beating the best house entry on it.
+V3 was therefore developed against a final-like harness: synthetic
+cases mimicking f00 — ~2.5 days of 10-min reads as a step function
+(Exophase refreshes every few hours), tracked population growing from
+~638 through several doublings with decelerating growth, per-trophy
+earners following story-progress dynamics (fast tutorial/story, slow
+grind/collectible, per-trophy saturation ceilings), the answer read at
+the last refresh before the target. 36 variants (12 core across
+pace / saturation / dilution / cadence axes + 24 expanded), two
+independent replications of the core 12 with different generator seeds
+(B and C), a 24 h-horizon pre-case suite, and a refresh suite (frozen
+p00 history + 40 synthetic first refreshes drawn from a different
+generative rule: population jump x4.5-7.5, sqrt-earner allocation,
+lognormal noise). Both house baselines are replicated exactly as
+scorers: persistence from the kit starter; the fitted curve per
+RULES.txt with random-walk + fit-residual spread combined by
+root-sum-of-squares.
+
+### What changed vs v2
+
+1. Sixth candidate `cand_curve_long`: the fitted curve over the last
+   72 h of reads. The house curve's 24 h window is short enough that a
+   single refresh interval can tilt its slope; the long window averages
+   several refreshes. (The backtest gives it weight mainly where the
+   24 h fit is unstable, e.g. stall cadences.)
+2. The rolling-origin backtest now runs at >= 4 distinct states
+   (v2: >= 6), its gated softmax is factored into `_gated_softmax`, and
+   the per-trophy shrinkage lambda is capped at 0.6.
+3. Horizon prior: as the horizon grows past a day, weight shifts from
+   the flat core (persistence, damped trend) to the curve family
+   (share 0.45 at the full 4.5 days), plus a damped -> curve shift
+   inside the family. The in-history backtest cannot see this on its
+   own: its origins reach at most the observed span (~2.5 d), where a
+   flat median's error is still small; at 4.5 days it grows like
+   sqrt(horizon) while a real trend's does not.
+4. Saturation tilt: `saturation_decel` measures each trophy's earner
+   growth per log-time in the recent third of the span vs the middle
+   third. A ratio under 1 (the progression wave is cresting) shifts
+   weight from the extrapolators to the flat candidates, and vice
+   versa; applied globally (median ratio) and per trophy (strength
+   0.7), capped so the backtest's judgement is tilted, never replaced.
+   Measured median ratios: saturation variants 0.77-0.87, others
+   0.95-1.19.
+5. Sharpening: final global and per-trophy weights are squared and
+   renormalised, concentrating each trophy's median on its favoured
+   candidates while keeping the hedges at reduced strength.
+6. The decomposition candidate is loosened: earner-growth decay scale
+   1.2 -> 3.0 in log-time, saturation ceiling max(1.8r, r+4) ->
+   max(3r, r+12), integration clamp [-2.0, +1.5] -> +/-3.0. Standalone
+   it overshoots on hard-saturation variants; the tilt (4) is the
+   counterweight, and the pair together beat either alone.
+7. Spread: a global x0.92 trim, and trophies whose last rate is
+   exactly 0.00 get a 5th percentile of 0.00 — nobody may earn them by
+   the target either. Scoring clamps quantiles to 0.01 before the
+   logit, so this costs no loss; it stops the band from starting above
+   a rate that is still zero. (On the saturation variants almost every
+   coverage miss was an exact-zero trophy; this fix alone was worth
+   ~0.14-0.31 of coverage there.)
+
+### Results (mean pinball loss on identical suites; lower is better)
+
+Final-like, seed A (36 variants): v3 0.3470, v2 0.4153, persistence
+0.7275, curve 0.3900. Core 12: v3 0.3478, v2 0.4127, curve 0.3841,
+persistence 0.7311. W-L for v3: vs v2 34-2 (all) / 11-1 (core); vs
+persistence 34-2 / 11-1; vs curve 31-5 / 10-2. Coverage90: v3 0.954,
+v2 0.812.
+
+Seed B core 12 (independent draws): v3 0.3612, v2 0.4247, persistence
+0.7532, curve 0.4046 — v3 goes 12W-0L against all three. Coverage
+0.941.
+
+Seed C core 12: v3 0.3873, v2 0.4377, persistence 0.7526, curve
+0.4075 — vs v2 11-1, vs persistence 11-1, vs curve 10-2. Coverage
+0.917.
+
+Pooled core (36 draws): v3 0.3654, v2 0.4250, curve 0.3987,
+persistence 0.7456; v3 vs v2 34W-2L, vs persistence 34W-2L, vs curve
+30W-6L. Coverage within [0.85, 0.95] on every seed family (0.954 /
+0.941 / 0.917 — seed A's 0.954 is the zero-trophy effect: the
+generator's grind tail prints more exact 0.00 rates than the real
+26 h page showed).
+
+Pre-case suite (24 h horizon, seed A core): v3 0.1885 vs v2 0.1906 —
+the long-horizon machinery correctly does almost nothing at a day.
+
+Refresh suite: v3's outputs are byte-identical to v2's (the frozen
+branch is untouched), 0.2330 vs persistence 1.4068 over the 40
+synthetic refreshes.
+
+### Remaining losses, named
+
+- fast-early-sat vs persistence: +0.016 (seed A), +0.028 (seed C),
+  a win on seed B (-0.013). The hardest family — v2's one expanded
+  loss lived here too. When the wave has fully crested by the
+  checkpoint, persistence is nearly right and any extrapolation pays;
+  v3 narrows the margin but does not erase it.
+- Seed A core vs curve: late-sat +0.001 and weak-dilution +0.006 —
+  inside single-draw noise; both are clear wins on seeds B and C.
+- Seed C stall-cadence vs curve: +0.151. Stall variants carry only
+  4-6 distinct states and every forecaster swings there (persistence
+  scores 0.80-1.02 across seeds); v3 wins stall on seeds A and B.
+
+The standing bar — no core loss to either house replica — holds
+exactly on seed B and in aggregate on all three seeds; the residual
+losses rotate by seed, the signature of draw noise around a real
+edge rather than a systematic gap. No parameter was tuned against a
+single seed's losses.
+
+### Negative results (tried, measured, dropped)
+
+- Pair-based backtest (origins x multiple target states, loss-vs-sqrt(h)
+  regression; pinball, then MAE): final-like 0.444-0.449 vs v2's
+  0.4153 and pre-case 0W-11L vs v2. Pinball with sqrt(h)-matched sigma
+  compresses candidate differences to noise; recency-squared weighting
+  starves the long-horizon points; the MAE version crowned persistence
+  on slow-pace. Reverted to v2's origin -> last-state backtest.
+- Sigma growth exponent 0.35 -> 0.5 (cap 1.8 -> 2.2): coverage
+  0.821 -> 0.838 but mean loss 0.3657 -> 0.3749. The low-coverage
+  variants' misses are one-sided median misses, not width misses.
+- Floor upper tail x1.9 for last rate < 0.10 (from x1.45 / < 0.05):
+  coverage overshot to 0.989 and the saturation variants paid for
+  width they did not need.
+- Deceleration-dependent sharpening power (1.15 at low decel rising
+  to 2.0): 0.3508 vs the flat power's 0.3470 — it helped
+  fast-early-sat and hurt late-sat / weak-dilution more.
+- Per-trophy tilt strength 1.0 in place of 0.7: 0.3548 vs 0.3470.
+
+### Gates
+
+- Determinism: two CLI runs over the kit practice inputs are
+  byte-identical; in-process double runs identical on the largest
+  cases. Output ~2.8 KB per case (cap 65,536), 55 rows x 5 monotone
+  finite quantiles in [0, 100].
+- Runtime: worst 0.36 s on a 359-read final-like case (cap 8 s).
+- Kit check (RULES.txt "Before you submit", run with v2's transcripts
+  bundle): 14 passed, 0 failed, 5 skipped, 5 checked at submission.
+  With --worktree against the same bundle, authorship reads 859/1067
+  counted lines (80.5%; bar 30%) with 208 lines absent — exactly v3's
+  new lines, which the v2 bundle predates; the bundle to submit with
+  is the one recorded from the v3 build session itself.
