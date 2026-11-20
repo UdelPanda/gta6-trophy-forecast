@@ -19,19 +19,27 @@ own history:
 
   * a saturating model of the tracked population (logistic or power law,
     chosen by a leave-the-future-out test on the population series itself);
-  * five candidate forecasters per trophy: persistence, a replica of the house
+  * six candidate forecasters per trophy: persistence, a replica of the house
     fitted-curve baseline (logit rate on ln(1 + hours since launch) over the
     last 24 h of reads), a damped log-time trend, a decomposition model
     that integrates (a_x - b_x) / (1 - rate) in log-time (earner growth minus
-    tracked-population growth, self-damping, with a saturation brake), and
-    the fitted curve again with its extrapolation damped toward the last
-    observed logit;
+    tracked-population growth, self-damping, with a saturation brake), the
+    fitted curve again with its extrapolation damped toward the last
+    observed logit, and the fitted curve over a 72 h window;
   * a rolling-origin backtest inside the history (fit on a prefix, score
     against the last state) that weights the candidates -- globally and,
     shrunk toward the global judgement, per trophy -- and calibrates the
     quantile spread from the ensemble's own logit residuals.  A trophy
     pinned near the floor gets a wider upper tail: it can only surprise
-    upward, when the progression wave reaches it.
+    upward, when the progression wave reaches it;
+  * three long-horizon corrections the backtest cannot judge on its own,
+    because its origins reach at most the observed span while the final
+    case asks twice as far: a horizon prior that shifts weight from the
+    flat candidates to the curve family as the horizon grows past a day,
+    a saturation tilt driven by each trophy's earner-growth deceleration
+    (a cresting progression wave moves weight to the flat side), and a
+    sharpening of the final weights toward each trophy's favoured
+    candidates.
 
 With a single distinct state (a frozen history, like the practice cases) no
 trend exists to fit, so it falls back to a dilution-aware prior: a refresh is
@@ -421,21 +429,47 @@ def cand_decomp(ctx):
         w = (e_last / (e_last + 80.0)) if e_last is not None else 0.3
         a_i = clamp(w * a_i + (1.0 - w) * a_med, -0.5, 3.0)
         r_last = ctx.last_rate[i]
-        ceiling = min(60.0, max(r_last * 1.8, r_last + 4.0))
+        ceiling = min(60.0, max(r_last * 3.0, r_last + 12.0))
         cur = lg0
         for k in range(steps):
             x_mid = x_last + (k + 0.5) * dx
             t_mid = math.expm1(x_mid)
             b_x = clamp(pop_log_deriv(ctx.pop, t_mid) * (1.0 + max(t_mid, -0.9)),
                         0.0, max(b_recent_x * 1.25, 1e-4))
-            a = a_i * math.exp(-(x_mid - x_last) / 1.2)
+            a = a_i * math.exp(-(x_mid - x_last) / 3.0)
             r_pct = inv_logit_pct(cur)
             if a > 0.0 and r_pct > ceiling:
                 a *= max(0.0, 1.0 - r_pct / ceiling)
             cur += (a - b_x) / max(1e-6, 1.0 - r_pct / 100.0) * dx
-        out[i] = clamp(cur, lg0 - 2.0, lg0 + 1.5)
+        out[i] = clamp(cur, lg0 - 3.0, lg0 + 3.0)
     return out
 
+
+
+def cand_curve_long(ctx):
+    """The fitted curve over a long window: least squares of logit rate on
+    ln(1 + hours since launch) over the last 72 h of reads (all of them if
+    the history is shorter), read at the target.  The house curve's 24 h
+    window is short enough that a single refresh interval can tilt its
+    slope; the long window averages several refreshes and reads the trend
+    the week is actually on.  Falls back to the 24 h curve when there are
+    too few reads."""
+    out = list(ctx.last_logit)
+    if not ctx.reads:
+        return out
+    t_last_read = ctx.reads[-1][0]
+    win = [(t, rates) for t, rates in ctx.reads if t >= t_last_read - 72.0]
+    if len(win) < 3:
+        return cand_curve(ctx)
+    x_t = math.log1p(max(ctx.t_target, -0.9))
+    for i in range(ctx.ntr):
+        pts = [(math.log1p(max(t, -0.9)), logit_pct(rates[i]))
+               for t, rates in win if i < len(rates) and rates[i] is not None]
+        if len(pts) < 3 or ctx.last_logit[i] is None:
+            continue
+        a, b, _ = ols([p[0] for p in pts], [p[1] for p in pts])
+        out[i] = clamp(a + b * x_t, -13.0, 13.0)
+    return out
 
 
 def cand_curve_damped(ctx):
@@ -465,7 +499,7 @@ def cand_curve_damped(ctx):
 
 
 CANDIDATES = (cand_persistence, cand_curve, cand_trend, cand_decomp,
-              cand_curve_damped)
+              cand_curve_damped, cand_curve_long)
 
 
 # ---------------------------------------------------------------------------
@@ -482,22 +516,82 @@ def pinball(median_logit, sigma, y_logit, levels):
     return total / len(levels)
 
 
+def _gated_softmax(losses, gate=0.18, temp=0.025):
+    """Drop candidates more than `gate` worse than the best, softmax the
+    rest with temperature `temp`.  losses may hold None."""
+    vals = [l for l in losses if l is not None]
+    if not vals:
+        return None
+    best = min(vals)
+    w = [0.0 if (l is None or l > best + gate) else math.exp(-(l - best) / temp)
+         for l in losses]
+    tw = sum(w)
+    if tw <= 0:
+        return None
+    return [x / tw for x in w]
+
+
+def saturation_decel(case, states):
+    """Per-trophy earner-growth deceleration: the trophies' earner growth
+    per unit of log-time over the most recent third of the observed span,
+    divided by the same quantity over the middle third.  A ratio well
+    under 1 says the progression wave is cresting -- players are finishing
+    what they were earning, so extrapolating the window's average slope
+    (what the curve and, partly, the decomposition do) overstates the
+    move, and the flat candidates gain.  Returns a list with one ratio per
+    trophy (None where earners are not observed well enough)."""
+    ntr = len(case["trophies"])
+    out = [None] * ntr
+    if len(states) < 6:
+        return out
+    t0, t1 = states[0].t, states[-1].t
+    span = t1 - t0
+    if span < 12.0:
+        return out
+
+    def x_of(t):
+        return math.log1p(max(t, -0.9))
+
+    def nearest(t):
+        return min(states, key=lambda st: abs(st.t - t))
+
+    s_a = nearest(t0 + span / 3.0)
+    s_b = nearest(t0 + 2.0 * span / 3.0)
+    s_c = states[-1]
+    dx1 = max(1e-6, x_of(s_b.t) - x_of(s_a.t))
+    dx2 = max(1e-6, x_of(s_c.t) - x_of(s_b.t))
+    for i in range(ntr):
+        e_a, e_b, e_c = (earners_at(s_a, i), earners_at(s_b, i),
+                         earners_at(s_c, i))
+        if e_a is None or e_b is None or e_c is None:
+            continue
+        if e_b < 3.0:
+            continue
+        a1 = (math.log(e_b + 0.5) - math.log(e_a + 0.5)) / dx1
+        a2 = (math.log(e_c + 0.5) - math.log(e_b + 0.5)) / dx2
+        if a1 <= 0.05:
+            continue
+        out[i] = clamp(a2 / a1, 0.0, 2.0)
+    return out
+
+
 def backtest(case, epoch, states, reads, levels):
-    """Fit each candidate on prefixes of the history and score it against the
-    final distinct state.  Returns (weights, residuals, mean_horizon,
-    per-trophy weights).  Origins are weighted by recency -- an origin late
-    in the history is fit on data whose dynamics resemble the final fit's,
-    while early origins are dominated by the launch transient and misjudge
-    the candidates.  The same gated softmax that turns the global losses
-    into candidate weights is also applied per trophy, then shrunk toward
-    the global weights by the amount of origin evidence behind it: which
-    candidate extrapolates honestly is a per-trophy fact (the curve is
-    right for a trophy in a clean log-time climb and wrong for one whose
-    growth is dilution-masked), and a global weight cannot express it."""
+    """Rolling-origin backtest: fit each candidate on prefixes of the
+    history and score against the final distinct state.  Returns
+    (weights, residuals, mean_horizon, per-trophy weights).  Origins are
+    weighted by recency -- an origin late in the history is fit on data
+    whose dynamics resemble the final fit's, while early origins are
+    dominated by the launch transient and misjudge the candidates.  The
+    same gated softmax that turns the global losses into candidate
+    weights is also applied per trophy, then shrunk toward the global
+    weights by the amount of origin evidence behind it: which candidate
+    extrapolates honestly is a per-trophy fact (the curve is right for a
+    trophy in a clean log-time climb and wrong for one whose growth is
+    dilution-masked), and a global weight cannot express it."""
     n = len(states)
     y = [logit_pct(rate_at(states[-1], i)) if rate_at(states[-1], i) is not None else None
          for i in range(len(case["trophies"]))]
-    lo = max(3, n // 3)
+    lo = max(2, n // 3)
     origins = [j for j in range(lo, n - 1)]
     if len(origins) > 12:
         step = len(origins) / 12.0
@@ -506,7 +600,6 @@ def backtest(case, epoch, states, reads, levels):
         return None, [], 0.0, None
     t_final = states[-1].t
     hor_days = {j: max(0.0, (t_final - states[j].t) / 24.0) for j in origins}
-    h_max = max(hor_days.values()) or 1.0
     losses = [0.0] * len(CANDIDATES)
     counts = [0.0] * len(CANDIDATES)
     pt_losses = [[0.0] * len(y) for _ in CANDIDATES]
@@ -542,48 +635,23 @@ def backtest(case, epoch, states, reads, levels):
     if not any(counts):
         return None, [], 0.0, None
     avg = [losses[k] / counts[k] if counts[k] else 1e9 for k in range(len(CANDIDATES))]
-    best = min(avg)
-    weights = []
-    for k in range(len(CANDIDATES)):
-        if avg[k] > best + 0.18:
-            weights.append(0.0)
-        else:
-            weights.append(math.exp(-(avg[k] - best) / 0.025))
-    tot_w = sum(weights)
-    if tot_w <= 0:
+    weights = _gated_softmax([a if a < 1e8 else None for a in avg])
+    if weights is None:
         return None, [], 0.0, None
-    weights = [w / tot_w for w in weights]
     # Per-trophy weights: the same gating/softmax on each trophy's own
     # backtest losses, shrunk toward the global weights by the amount of
     # origin evidence behind them (a trophy seen at few origins keeps the
     # global judgement).
     pt_weights = []
     for i in range(len(y)):
-        raw = []
-        b_i = None
-        for k in range(len(CANDIDATES)):
-            if pt_counts[k][i] > 0:
-                a = pt_losses[k][i] / pt_counts[k][i]
-                raw.append(a)
-                b_i = a if b_i is None else min(b_i, a)
-            else:
-                raw.append(None)
-        if b_i is None:
+        raw = [pt_losses[k][i] / pt_counts[k][i] if pt_counts[k][i] > 0 else None
+               for k in range(len(CANDIDATES))]
+        w_i = _gated_softmax(raw)
+        if w_i is None:
             pt_weights.append(list(weights))
             continue
-        w_i = []
-        for k in range(len(CANDIDATES)):
-            if raw[k] is None or raw[k] > b_i + 0.18:
-                w_i.append(0.0)
-            else:
-                w_i.append(math.exp(-(raw[k] - b_i) / 0.025))
-        tw = sum(w_i)
-        if tw <= 0:
-            pt_weights.append(list(weights))
-            continue
-        w_i = [w / tw for w in w_i]
         m_ev = max(pt_counts[k][i] for k in range(len(CANDIDATES)))
-        lam = m_ev / (m_ev + 0.75)
+        lam = min(0.6, m_ev / (m_ev + 0.75))
         pt_weights.append([lam * w_i[k] + (1.0 - lam) * weights[k]
                            for k in range(len(CANDIDATES))])
     residuals = []
@@ -600,6 +668,81 @@ def backtest(case, epoch, states, reads, levels):
                 residuals.append(y[i] - num / den)
     mean_horizon = sum(horizon_days) / len(horizon_days) if horizon_days else 0.0
     return weights, residuals, mean_horizon, pt_weights
+
+
+# Candidate indices, for the tilts in ensemble_forecast.
+IDX_PERSIST, IDX_CURVE, IDX_TREND, IDX_DECOMP, IDX_DAMPED, IDX_CURVE_LONG = range(6)
+EXTRAPOLATORS = (IDX_CURVE, IDX_DECOMP, IDX_CURVE_LONG)
+FLAT = (IDX_PERSIST, IDX_TREND, IDX_DAMPED)
+
+
+def _shift_weight(w, src, dst, move):
+    """Move `move` of total weight from the src group to the dst group,
+    proportionally within each group."""
+    avail = sum(w[k] for k in src)
+    move = min(move, avail)
+    if avail <= 0 or move <= 0:
+        return w
+    for k in src:
+        w[k] -= move * w[k] / avail
+    dst_tot = sum(w[k] for k in dst)
+    for k in dst:
+        w[k] += move * (w[k] / dst_tot if dst_tot > 0 else 1.0 / len(dst))
+    tot = sum(w)
+    return [x / tot for x in w] if tot > 0 else w
+
+
+# The curve family: candidates whose median is a fitted log-time trend.
+CURVE_FAMILY = (IDX_CURVE, IDX_DAMPED, IDX_CURVE_LONG)
+FLAT_CORE = (IDX_PERSIST, IDX_TREND)
+
+
+def horizon_prior(weights, horizon_d, strength=1.0):
+    """At long horizons, move weight from the flat core (persistence and
+    the damped trend, whose medians barely move) to the curve family.
+    The in-history backtest cannot see why: its origins reach at most
+    ~2.5 days, where a flat median's error is still small, while at the
+    final's 4.5 days a flat median's error grows with the square root of
+    the horizon and a fitted trend's does not (when the trend is real,
+    which the backtest itself judges).  The shift grows with the horizon
+    and is zero at a day, so short-horizon cases keep the backtest's own
+    verdict."""
+    if weights is None:
+        return weights
+    factor = clamp((horizon_d - 1.0) / 3.5, 0.0, 1.0) * strength
+    share = 0.45 * factor
+    if share <= 0:
+        return list(weights)
+    w = list(weights)
+    flat_w = sum(w[k] for k in FLAT_CORE)
+    w = _shift_weight(w, FLAT_CORE, CURVE_FAMILY, share * flat_w)
+    # Within the family, the damped curve's shrinkage is a short-horizon
+    # hedge: at multi-day horizons a real trend has usually run further
+    # than the damped read, so part of its weight follows the raw curve.
+    damped_w = w[IDX_DAMPED]
+    if damped_w > 0:
+        w = _shift_weight(w, (IDX_DAMPED,), (IDX_CURVE,), 0.30 * factor * damped_w)
+    return w
+
+
+def tilt_weights(weights, decel, strength=1.0):
+    """Shift weight between the extrapolators (curve, decomposition,
+    long curve) and the flat candidates (persistence, damped trend,
+    damped curve) according to the earner-growth deceleration: below a
+    ratio of 1 the wave is cresting and weight moves to the flat side,
+    above 1 it is still building and weight moves the other way.  The
+    shift is capped so the backtest's judgement is tilted, never
+    replaced."""
+    if weights is None or decel is None:
+        return weights
+    d = clamp(decel, 0.0, 1.6)
+    shift = clamp((1.0 - d) * 1.0, -0.25, 0.50) * strength
+    if abs(shift) < 1e-9:
+        return list(weights)
+    w = list(weights)
+    if shift > 0:  # cresting: extrapolators -> flat
+        return _shift_weight(w, EXTRAPOLATORS, FLAT, shift)
+    return _shift_weight(w, FLAT, EXTRAPOLATORS, -shift)
 
 
 # ---------------------------------------------------------------------------
@@ -733,13 +876,48 @@ def ensemble_forecast(case, epoch, states, reads, t_target, levels):
     ctx = Ctx(case, epoch, states, reads, t_target)
     meds = [cand(ctx) for cand in CANDIDATES]
     weights, residuals, bt_horizon_d, pt_weights = (None, [], 0.0, None)
-    if len(states) >= 6:
+    if len(states) >= 4:
         weights, residuals, bt_horizon_d, pt_weights = backtest(
             case, epoch, states, reads, levels)
     if weights is None:
-        weights = [0.2, 0.2, 0.2, 0.2, 0.2]
-        if meds[3] is None:
-            weights = [0.25, 0.25, 0.25, 0.0, 0.25]
+        weights = [1.0 / len(CANDIDATES)] * len(CANDIDATES)
+        if meds[IDX_DECOMP] is None:
+            weights = [0.2, 0.2, 0.2, 0.0, 0.2, 0.2]
+    # Horizon prior: at multi-day horizons the flat core's medians are
+    # systematically underrated by the in-history backtest (see
+    # horizon_prior); shift part of their weight to the curve family.
+    horizon_d_early = ctx.horizon_h / 24.0
+    weights = horizon_prior(weights, horizon_d_early)
+    if pt_weights is not None:
+        pt_weights = [horizon_prior(w_row, horizon_d_early, strength=0.8)
+                      for w_row in pt_weights]
+    # Saturation tilt: if the trophies' earner growth has decelerated
+    # into the checkpoint, the extrapolators are reading a slope the wave
+    # has already stopped climbing; shift weight toward the flat
+    # candidates (and back when growth is still accelerating).
+    decel = saturation_decel(case, states)
+    decel_vals = sorted(d for d in decel if d is not None)
+    if len(decel_vals) >= 8:
+        med_decel = decel_vals[len(decel_vals) // 2]
+        weights = tilt_weights(weights, med_decel)
+        if pt_weights is not None:
+            pt_weights = [tilt_weights(pt_weights[i], decel[i], strength=0.7)
+                          if decel[i] is not None else pt_weights[i]
+                          for i in range(ntr)]
+    # Sharpen: a weighted average of all six medians always lands between
+    # them, and between is where the loss lives when one candidate has the
+    # dynamics right.  Squaring the final weights concentrates each
+    # trophy's median on its favoured candidates while keeping the hedges
+    # present at reduced strength.  (A deceleration-dependent power was
+    # tried on the final-like suites and lost to the flat power; see the
+    # DEVLOG.)
+    def _sharpen(w_row):
+        sw = [max(x, 0.0) ** 2.0 for x in w_row]
+        tw = sum(sw)
+        return [x / tw for x in sw] if tw > 0 else w_row
+    weights = _sharpen(weights)
+    if pt_weights is not None:
+        pt_weights = [_sharpen(w_row) for w_row in pt_weights]
     # Fallback medians for trophies no candidate can speak for.
     fallback = median_of([r for r in ctx.last_rate if r is not None])
     fallback_logit = logit_pct(fallback) if fallback is not None else logit_pct(0.5)
@@ -756,6 +934,10 @@ def ensemble_forecast(case, epoch, states, reads, t_target, levels):
         sigma = clamp(0.65 * rms * scale + 0.35 * sigma_rw * 1.05, 0.35, 2.4)
     else:
         sigma = clamp(sigma_rw * 1.15, 0.35, 2.4)
+    # A small global trim: with the zero-rate lower tail fixed (see the
+    # row builder below), the calibrated band covered ~96% on final-like
+    # suites against a 90% nominal, and pinball pays for the excess width.
+    sigma *= 0.92
     rows = []
     for i in range(ntr):
         w_row = pt_weights[i] if pt_weights is not None else weights
@@ -777,8 +959,16 @@ def ensemble_forecast(case, epoch, states, reads, t_target, levels):
         # trophies; the lower tail keeps the calibrated spread.
         s_up = s * 1.45 if (ctx.last_rate[i] is not None
                             and ctx.last_rate[i] < 0.05) else s
-        rows.append([med + _NORM.inv_cdf(tau) * (s_up if tau > 0.5 else s)
-                     for tau in levels])
+        row = [med + _NORM.inv_cdf(tau) * (s_up if tau > 0.5 else s)
+               for tau in levels]
+        if ctx.last_rate[i] is not None and ctx.last_rate[i] == 0.0:
+            # A rate that prints exactly 0.00 has a 5th percentile of
+            # 0.00 too: nobody may earn it by the target either.  (The
+            # scoring clamps quantiles to 0.01 before the logit, so this
+            # costs nothing there; it only stops the band from starting
+            # above a rate that is still zero.)
+            row[0] = min(row[0], -16.0)
+        rows.append(row)
     return rows
 
 
