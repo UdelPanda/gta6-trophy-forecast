@@ -19,14 +19,19 @@ own history:
 
   * a saturating model of the tracked population (logistic or power law,
     chosen by a leave-the-future-out test on the population series itself);
-  * four candidate forecasters per trophy: persistence, a replica of the house
+  * five candidate forecasters per trophy: persistence, a replica of the house
     fitted-curve baseline (logit rate on ln(1 + hours since launch) over the
-    last 24 h of reads), a damped log-time trend, and a decomposition model
+    last 24 h of reads), a damped log-time trend, a decomposition model
     that integrates (a_x - b_x) / (1 - rate) in log-time (earner growth minus
-    tracked-population growth, self-damping, with a saturation brake);
+    tracked-population growth, self-damping, with a saturation brake), and
+    the fitted curve again with its extrapolation damped toward the last
+    observed logit;
   * a rolling-origin backtest inside the history (fit on a prefix, score
-    against the last state) that weights the candidates and calibrates the
-    quantile spread from the ensemble's own logit residuals.
+    against the last state) that weights the candidates -- globally and,
+    shrunk toward the global judgement, per trophy -- and calibrates the
+    quantile spread from the ensemble's own logit residuals.  A trophy
+    pinned near the floor gets a wider upper tail: it can only surprise
+    upward, when the progression wave reaches it.
 
 With a single distinct state (a frozen history, like the practice cases) no
 trend exists to fit, so it falls back to a dilution-aware prior: a refresh is
@@ -432,7 +437,35 @@ def cand_decomp(ctx):
     return out
 
 
-CANDIDATES = (cand_persistence, cand_curve, cand_trend, cand_decomp)
+
+def cand_curve_damped(ctx):
+    """The fitted-curve candidate with its extrapolation damped: the move
+    away from the last observed logit is shrunk by the ratio of the fit
+    window's log-time span to that span plus the extrapolation distance.
+    A log-time line read far beyond its window overstates moves that are
+    already saturating; the damping grows exactly with that distance."""
+    base = cand_curve(ctx)
+    out = list(ctx.last_logit)
+    if not ctx.reads:
+        return out
+    t_last_read = ctx.reads[-1][0]
+    win = [(t, rates) for t, rates in ctx.reads if t >= t_last_read - 24.0]
+    if len(win) < 3:
+        return base
+    x0 = math.log1p(max(win[0][0], -0.9))
+    x1 = math.log1p(max(ctx.t_last, -0.9))
+    x_t = math.log1p(max(ctx.t_target, -0.9))
+    span = max(1e-6, x1 - x0)
+    damp = span / (span + max(0.0, x_t - x1))
+    for i in range(ctx.ntr):
+        if base[i] is None or ctx.last_logit[i] is None:
+            continue
+        out[i] = ctx.last_logit[i] + (base[i] - ctx.last_logit[i]) * damp
+    return out
+
+
+CANDIDATES = (cand_persistence, cand_curve, cand_trend, cand_decomp,
+              cand_curve_damped)
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +484,16 @@ def pinball(median_logit, sigma, y_logit, levels):
 
 def backtest(case, epoch, states, reads, levels):
     """Fit each candidate on prefixes of the history and score it against the
-    final distinct state.  Returns (weights, ensemble residuals in logits)."""
+    final distinct state.  Returns (weights, residuals, mean_horizon,
+    per-trophy weights).  Origins are weighted by recency -- an origin late
+    in the history is fit on data whose dynamics resemble the final fit's,
+    while early origins are dominated by the launch transient and misjudge
+    the candidates.  The same gated softmax that turns the global losses
+    into candidate weights is also applied per trophy, then shrunk toward
+    the global weights by the amount of origin evidence behind it: which
+    candidate extrapolates honestly is a per-trophy fact (the curve is
+    right for a trophy in a clean log-time climb and wrong for one whose
+    growth is dilution-masked), and a global weight cannot express it."""
     n = len(states)
     y = [logit_pct(rate_at(states[-1], i)) if rate_at(states[-1], i) is not None else None
          for i in range(len(case["trophies"]))]
@@ -461,10 +503,14 @@ def backtest(case, epoch, states, reads, levels):
         step = len(origins) / 12.0
         origins = sorted({origins[int(k * step)] for k in range(12)})
     if not origins:
-        return None, [], 0.0
+        return None, [], 0.0, None
     t_final = states[-1].t
+    hor_days = {j: max(0.0, (t_final - states[j].t) / 24.0) for j in origins}
+    h_max = max(hor_days.values()) or 1.0
     losses = [0.0] * len(CANDIDATES)
-    counts = [0] * len(CANDIDATES)
+    counts = [0.0] * len(CANDIDATES)
+    pt_losses = [[0.0] * len(y) for _ in CANDIDATES]
+    pt_counts = [[0.0] * len(y) for _ in CANDIDATES]
     cache = []  # per origin: (candidate medians, horizon_days)
     horizon_days = []
     for j in origins:
@@ -473,9 +519,6 @@ def backtest(case, epoch, states, reads, levels):
         ctx = Ctx(case, epoch, prefix, pre_reads, t_final)
         sigma = 0.5 * math.sqrt(max(0.0, (t_final - prefix[-1].t)) / 24.0)
         meds = []
-        # Recency weight: an origin late in the history is fit on data whose
-        # dynamics resemble the final fit's; early origins are dominated by
-        # the launch transient and would misjudge the candidates.
         w_origin = (j / max(1, n - 1)) ** 2
         for k, cand in enumerate(CANDIDATES):
             m = cand(ctx)
@@ -486,15 +529,18 @@ def backtest(case, epoch, states, reads, levels):
             for i in range(ctx.ntr):
                 if m[i] is None or y[i] is None:
                     continue
-                tot += pinball(m[i], max(sigma, 0.05), y[i], levels)
+                pb = pinball(m[i], max(sigma, 0.05), y[i], levels)
+                tot += pb
                 cnt += 1
+                pt_losses[k][i] += w_origin * pb
+                pt_counts[k][i] += w_origin
             if cnt:
                 losses[k] += w_origin * tot / cnt
                 counts[k] += w_origin
-        cache.append((meds, max(0.0, (t_final - prefix[-1].t) / 24.0)))
-        horizon_days.append(max(0.0, (t_final - prefix[-1].t) / 24.0))
+        cache.append((meds, hor_days[j]))
+        horizon_days.append(hor_days[j])
     if not any(counts):
-        return None, [], 0.0
+        return None, [], 0.0, None
     avg = [losses[k] / counts[k] if counts[k] else 1e9 for k in range(len(CANDIDATES))]
     best = min(avg)
     weights = []
@@ -505,8 +551,41 @@ def backtest(case, epoch, states, reads, levels):
             weights.append(math.exp(-(avg[k] - best) / 0.025))
     tot_w = sum(weights)
     if tot_w <= 0:
-        return None, [], 0.0
+        return None, [], 0.0, None
     weights = [w / tot_w for w in weights]
+    # Per-trophy weights: the same gating/softmax on each trophy's own
+    # backtest losses, shrunk toward the global weights by the amount of
+    # origin evidence behind them (a trophy seen at few origins keeps the
+    # global judgement).
+    pt_weights = []
+    for i in range(len(y)):
+        raw = []
+        b_i = None
+        for k in range(len(CANDIDATES)):
+            if pt_counts[k][i] > 0:
+                a = pt_losses[k][i] / pt_counts[k][i]
+                raw.append(a)
+                b_i = a if b_i is None else min(b_i, a)
+            else:
+                raw.append(None)
+        if b_i is None:
+            pt_weights.append(list(weights))
+            continue
+        w_i = []
+        for k in range(len(CANDIDATES)):
+            if raw[k] is None or raw[k] > b_i + 0.18:
+                w_i.append(0.0)
+            else:
+                w_i.append(math.exp(-(raw[k] - b_i) / 0.025))
+        tw = sum(w_i)
+        if tw <= 0:
+            pt_weights.append(list(weights))
+            continue
+        w_i = [w / tw for w in w_i]
+        m_ev = max(pt_counts[k][i] for k in range(len(CANDIDATES)))
+        lam = m_ev / (m_ev + 0.75)
+        pt_weights.append([lam * w_i[k] + (1.0 - lam) * weights[k]
+                           for k in range(len(CANDIDATES))])
     residuals = []
     for meds, _ in cache:
         for i in range(len(y)):
@@ -520,7 +599,7 @@ def backtest(case, epoch, states, reads, levels):
             if den > 0:
                 residuals.append(y[i] - num / den)
     mean_horizon = sum(horizon_days) / len(horizon_days) if horizon_days else 0.0
-    return weights, residuals, mean_horizon
+    return weights, residuals, mean_horizon, pt_weights
 
 
 # ---------------------------------------------------------------------------
@@ -571,10 +650,10 @@ def frozen_forecast(case, states, t_target, levels):
     p_refresh = clamp(1.0 - math.exp(-horizon_h / remaining), 0.0, 0.97)
     age_h = max(0.0, st.t)
     # Population jump at a refresh, shrinking as the launch surge ages.
-    growth = 1.0 + 5.2 * math.exp(-age_h / 30.0)
+    growth = 1.0 + 5.06 * math.exp(-age_h / 30.0)
     # Total earners growth (non-tutorial) by the refresh: +34% at the first
     # refresh, less (proportionally) as the base grows with age.
-    earn_growth = clamp(0.34 * math.exp(-age_h / 48.0) + 0.04, 0.05, 0.40)
+    earn_growth = clamp(0.30 * math.exp(-age_h / 48.0) + 0.038, 0.05, 0.40)
     # Earners per trophy now, and the allocation of the growth across them.
     earners = [earners_at(st, i) for i in range(ntr)]
     observed = sorted(r for r in rates if r is not None)
@@ -620,8 +699,14 @@ def frozen_forecast(case, states, t_target, levels):
             mu_a = logit_pct(r) if r > 0.0 else logit_pct(0.02)
             mu_b = logit_pct(r_b)
             e_i = earners[i] if earners[i] is not None else 0.0
-            s_b = clamp(0.45 + 0.9 / math.sqrt(e_i + 4.0), 0.5, 1.1) \
-                + 0.18 * math.sqrt(max(0.0, horizon_d - 0.1))
+            # The 0.75 factor calibrates the branch's dispersion to the one
+            # realised refresh and to synthetic ones: unscaled, the
+            # mixture's 90% interval covered ~98% of outcomes (the real
+            # practice answers and 40 synthetic refreshes drawn from a
+            # different generative rule alike) against a 90% nominal, and
+            # pinball loss is paid for every unit of unneeded width.
+            s_b = 0.75 * (clamp(0.45 + 0.9 / math.sqrt(e_i + 4.0), 0.5, 1.1)
+                + 0.18 * math.sqrt(max(0.0, horizon_d - 0.1)))
             qs = []
             for tau in levels:
                 lo, hi = -14.0, 14.0
@@ -647,13 +732,14 @@ def ensemble_forecast(case, epoch, states, reads, t_target, levels):
     ntr = len(case["trophies"])
     ctx = Ctx(case, epoch, states, reads, t_target)
     meds = [cand(ctx) for cand in CANDIDATES]
-    weights, residuals, bt_horizon_d = (None, [], 0.0)
+    weights, residuals, bt_horizon_d, pt_weights = (None, [], 0.0, None)
     if len(states) >= 6:
-        weights, residuals, bt_horizon_d = backtest(case, epoch, states, reads, levels)
+        weights, residuals, bt_horizon_d, pt_weights = backtest(
+            case, epoch, states, reads, levels)
     if weights is None:
-        weights = [0.25, 0.25, 0.25, 0.25]
+        weights = [0.2, 0.2, 0.2, 0.2, 0.2]
         if meds[3] is None:
-            weights = [0.34, 0.33, 0.33, 0.0]
+            weights = [0.25, 0.25, 0.25, 0.0, 0.25]
     # Fallback medians for trophies no candidate can speak for.
     fallback = median_of([r for r in ctx.last_rate if r is not None])
     fallback_logit = logit_pct(fallback) if fallback is not None else logit_pct(0.5)
@@ -672,18 +758,27 @@ def ensemble_forecast(case, epoch, states, reads, t_target, levels):
         sigma = clamp(sigma_rw * 1.15, 0.35, 2.4)
     rows = []
     for i in range(ntr):
+        w_row = pt_weights[i] if pt_weights is not None else weights
         num, den = 0.0, 0.0
         for k in range(len(CANDIDATES)):
-            if weights[k] > 0 and meds[k] is not None and meds[k][i] is not None:
-                num += weights[k] * meds[k][i]
-                den += weights[k]
+            if w_row[k] > 0 and meds[k] is not None and meds[k][i] is not None:
+                num += w_row[k] * meds[k][i]
+                den += w_row[k]
         med = num / den if den > 0 else fallback_logit
         s = sigma
         if ctx.last_rate[i] is not None and ctx.last_rate[i] >= 99.9:
             s = min(s, 0.35)
         elif ctx.last_earners[i] is not None and ctx.last_earners[i] < 5.0:
             s *= 1.25
-        rows.append([med + _NORM.inv_cdf(tau) * s for tau in levels])
+        # A trophy pinned near the floor can only surprise upward: its
+        # earners are a progression wave that has not arrived yet, and the
+        # wave multiplies the rate when it lands, while the downside is
+        # bounded by the floor itself.  Widen the upper tail for such
+        # trophies; the lower tail keeps the calibrated spread.
+        s_up = s * 1.45 if (ctx.last_rate[i] is not None
+                            and ctx.last_rate[i] < 0.05) else s
+        rows.append([med + _NORM.inv_cdf(tau) * (s_up if tau > 0.5 else s)
+                     for tau in levels])
     return rows
 
 
